@@ -1,0 +1,792 @@
+#' @title Prepare Multilayer Graphs
+#'
+#' @noRd
+
+prepare_multilayer_graphs <- function(layers, directed = FALSE, require_same_nodes = TRUE) {
+
+  # check for required package ----
+  if (!requireNamespace("igraph", quietly = TRUE)) {
+    stop("Package 'igraph' is required.", call. = FALSE)
+  }
+
+  # check layers argument ----
+  if (!is.list(layers) || length(layers) < 2) {
+    stop("`layers` must be a list with at least two network layers.", call. = FALSE)
+  }
+
+  # create graph for each layer ----
+  graph_layers <- lapply(seq_along(layers), function(i) {
+    layer <- layers[[i]]
+    if (inherits(layer, "igraph")) {
+
+      ## return layer as-is if already an igraph object ----
+      layer_graph <- layer
+    } else {
+
+      ## check that layer is a matrix ----
+      if (!is.matrix(layer)) {
+        stop(sprintf("Layer %d is not an igraph object or adjacency matrix.", i), call. = FALSE)
+      }
+
+      ## check that layer matrix is square ----
+      if (nrow(layer) != ncol(layer)) {
+        stop(sprintf("Layer %d adjacency matrix must be square.", i), call. = FALSE)
+      }
+
+      ## create layer graph from adjacency matrix ----
+      layer_graph <- igraph::graph_from_adjacency_matrix(
+        adjmatrix = layer,
+        mode = if (directed) "directed" else "undirected",
+        weighted = TRUE,
+        diag = FALSE
+      )
+    }
+
+    # return layer graph ----
+    return(layer_graph)
+  })
+
+  # validate shared node universe across all layers ----
+  # Layers are compared on vertex names when present, on vertex indices
+  # otherwise. Interlayer ties and meta-communities assume node i in one
+  # layer is node i in every other layer, so unequal universes are rejected
+  # unless the caller explicitly opts out (identity ties only).
+  if (require_same_nodes) {
+    node_ids <- lapply(graph_layers, function(g) {
+      nm <- igraph::V(g)$name
+      if (is.null(nm)) as.character(seq_len(igraph::vcount(g))) else as.character(nm)
+    })
+    ref <- sort(node_ids[[1]])
+    same <- vapply(node_ids[-1], function(ids) identical(sort(ids), ref), logical(1))
+    if (!all(same)) {
+      stop(
+        "All layers must share the same node set. Found layers with different ",
+        "nodes; align the node universe (adding isolates where needed) before ",
+        "fitting, or, for identity ties only, use allow_unequal_nodes = TRUE.",
+        call. = FALSE
+      )
+    }
+  }
+
+  # assign layer names when no names are present ----
+  if (is.null(names(graph_layers))) {
+    names(graph_layers) <- paste0("layer_", seq_along(graph_layers))
+  }
+
+  # return compiled graph layers ----
+  return(graph_layers)
+}
+
+
+#' @title Save and Restore the Global RNG State
+#'
+#' @description Used by the `seed` argument of the fit functions: the caller
+#' saves the state, seeds the RNG for reproducible community detection, and
+#' restores the state on exit so seeded detection never disturbs the caller's
+#' random number stream (e.g. the bootstrap's resampling draws).
+#'
+#' @noRd
+
+save_rng_state <- function() {
+  if (exists(".Random.seed", envir = globalenv(), inherits = FALSE)) {
+    get(".Random.seed", envir = globalenv(), inherits = FALSE)
+  } else {
+    NULL
+  }
+}
+
+#' @noRd
+restore_rng_state <- function(state) {
+  if (is.null(state)) {
+    if (exists(".Random.seed", envir = globalenv(), inherits = FALSE)) {
+      rm(".Random.seed", envir = globalenv())
+    }
+  } else {
+    assign(".Random.seed", state, envir = globalenv())
+  }
+  invisible(NULL)
+}
+
+#' @title Make Layer Links
+#'
+#' @noRd
+
+make_layer_links <- function(n_layers, layer_links = NULL) {
+
+  # construct or check appropriate layer links ----
+  if (is.null(layer_links)) {
+
+    ## assign equally-weighted links if no links are provided ----
+    layer_links <- data.frame(
+      from = seq_len(n_layers - 1),
+      to = seq(2, n_layers),
+      weight = 1,
+      stringsAsFactors = FALSE
+    )
+  } else {
+
+    ## check that layer links consists of a data frame with the appropriate columns ----
+    if (!is.data.frame(layer_links) || !all(c("from", "to") %in% names(layer_links))) {
+      stop("`layer_links` must be a data.frame with columns `from` and `to`.", call. = FALSE)
+    }
+
+    ## assign equal weights if no weight column is present ----
+    if (!"weight" %in% names(layer_links)) {
+      layer_links$weight <- 1
+    }
+
+    ## check that layer link indices are within bounds ----
+    if (any(layer_links$from < 1 | layer_links$to < 1 | layer_links$from > n_layers | layer_links$to > n_layers)) {
+      stop("`layer_links` indices must be between 1 and number of layers.", call. = FALSE)
+    }
+  }
+
+  # return layer links ----
+  return(layer_links)
+}
+
+
+
+#' @title Fit Layer Communities
+#'
+#' @noRd
+
+fit_layer_communities <- function(
+    graph_layers,
+    algorithm = c("louvain", "leiden"),
+    resolution_parameter = 1,
+    directed = FALSE,
+    objective = NULL
+  ) {
+
+  # check algorithm argument ----
+  algorithm <- match.arg(algorithm)
+
+  # check objective argument ----
+  if (!is.null(objective)) {
+    objective <- tolower(objective)
+    if (!objective %in% c("modularity", "cpm")) {
+      stop("`objective` must be one of 'modularity' or 'cpm'.", call. = FALSE)
+    }
+    if (algorithm == "louvain" && objective == "cpm") {
+      stop("Louvain does not support the CPM objective. Use algorithm = 'leiden'.", call. = FALSE)
+    }
+  }
+
+  # resolve effective objective between explicit choice or default based on direction ----
+  effective_objective <- if (!is.null(objective)) objective else if (directed) "cpm" else "modularity"
+
+  # check for negative edge weights for modularity objectives ----
+  if (effective_objective == "modularity") {
+    for (i in seq_along(graph_layers)) {
+      w <- igraph::E(graph_layers[[i]])$weight
+      if (!is.null(w) && any(w < 0)) {
+        stop(
+          sprintf(
+            fmt = paste0(
+              "Layer %d contains negative edge weights. ",
+              "Modularity-based methods do not support negative weights. ",
+              "Use objective = \"cpm\" to select the CPM objective, ",
+              "which handles negative weights correctly."
+            ),
+            i
+          ),
+          call. = FALSE
+        )
+      }
+    }
+  }
+
+  # warn once for directed leiden (collapsed per layer below) ----
+  if (algorithm == "leiden" && directed &&
+      any(vapply(graph_layers, igraph::is_directed, logical(1)))) {
+    warning(
+      "Leiden in igraph does not support directed graphs; ",
+      "collapsing directed layers to weighted undirected graphs. ",
+      "For directed-aware detection use the Python package (leidenalg).",
+      call. = FALSE
+    )
+  }
+
+  # fit communities for each layer ----
+  layer_communities <- lapply(graph_layers, function(g) {
+    g_input <- g
+
+    ## identify community clusters ----
+    if (algorithm == "louvain") {
+
+      ### convert to undirected graph ----
+      if (directed && igraph::is_directed(g_input)) {
+        g <- igraph::as_undirected(
+          graph = g_input,
+          mode = "collapse",
+          edge.attr.comb = list(weight = "sum")
+        )
+      }
+
+      ### find louvain community clusters ----
+      cl <- igraph::cluster_louvain(
+        graph = g,
+        weights = igraph::E(g)$weight,
+        resolution = resolution_parameter
+      )
+    } else {
+
+      ### convert to undirected graph ----
+      ### (igraph's cluster_leiden supports undirected graphs only; see
+      ### community/leiden.c. Mirror the louvain path: collapse directed
+      ### layers to weighted undirected graphs; warned once above.)
+      if (directed && igraph::is_directed(g_input)) {
+        g <- igraph::as_undirected(
+          graph = g_input,
+          mode = "collapse",
+          edge.attr.comb = list(weight = "sum")
+        )
+      }
+
+      ### find leiden community clusters ----
+      cl <- igraph::cluster_leiden(
+        graph = g,
+        objective_function = if (effective_objective == "cpm") "CPM" else "modularity",
+        resolution = resolution_parameter,
+        weights = igraph::E(g)$weight
+      )
+    }
+
+    ## compile communities information for a single layer ----
+    communities <- list(
+      membership = igraph::membership(cl),
+      modularity = if (igraph::is_directed(g_input) || effective_objective == "cpm") {
+        NA_real_
+      } else {
+        igraph::modularity(g, igraph::membership(cl), weights = igraph::E(g)$weight)
+      },
+      communities = split(seq_along(igraph::membership(cl)), igraph::membership(cl))
+    )
+
+    ## return communities information for a single layer ----
+    return(communities)
+  })
+
+  # return layer communities ----
+  return(layer_communities)
+}
+
+
+
+#' @title Weighted Jaccard
+#'
+#' @noRd
+
+weighted_jaccard <- function(a, b) {
+  inter <- length(intersect(a, b))
+  union <- length(union(a, b))
+  if (union == 0) {
+    jaccard <- 0
+  } else {
+    jaccard <- inter / union
+  }
+  return(jaccard)
+}
+
+
+
+#' @title Weighted Overlap
+#'
+#' @noRd
+
+weighted_overlap <- function(a, b) {
+  inter <- length(intersect(a, b))
+  min_size <- min(length(a), length(b))
+  if (min_size == 0) {
+    overlap <- 0
+  } else {
+    overlap <- inter / min_size
+  }
+  return(overlap)
+}
+
+
+
+#' @title Weighted Jaccard Similarity
+#'
+#' @noRd
+
+weighted_jaccard_similarity <- function(a, b, weights_a, weights_b) {
+
+  # assign nodes ----
+  nodes <- union(a, b)
+
+  # assign weighted similarity ----
+  if (length(nodes) == 0) {
+    weighted_similarity <- 0
+  } else {
+    node_keys <- as.character(nodes)
+    wa <- weights_a[as.character(nodes)]
+    wb <- weights_b[as.character(nodes)]
+    wa[is.na(wa)] <- 0
+    wb[is.na(wb)] <- 0
+    inter_weight <- sum(pmin(wa, wb))
+    union_weight <- sum(pmax(wa, wb))
+    if (union_weight == 0) {
+      weighted_similarity <- 0
+    } else {
+      weighted_similarity <- inter_weight / union_weight
+    }
+  }
+
+  # return weighted similarity ----
+  return(weighted_similarity)
+}
+
+
+
+#' @title Weighted Overlap Similarity
+#'
+#' @noRd
+
+weighted_overlap_similarity <- function(a, b, weights_a, weights_b) {
+
+  # assign weighted similarity ----
+  inter <- intersect(a, b)
+  inter_weight <- sum(vapply(inter, function(node) {
+    min(weights_a[[as.character(node)]], weights_b[[as.character(node)]])
+  }, numeric(1)))
+  a_weight <- sum(vapply(a, function(node) weights_a[[as.character(node)]], numeric(1)))
+  b_weight <- sum(vapply(b, function(node) weights_b[[as.character(node)]], numeric(1)))
+  min_weight <- min(a_weight, b_weight)
+  if (min_weight == 0) {
+    weighted_similarity <- 0
+  } else {
+    weighted_similarity <- inter_weight / min_weight
+  }
+
+  # return weighted similarity ----
+  return(weighted_similarity)
+}
+
+
+
+#' @title Layer Node Strengths
+#'
+#' @noRd
+
+layer_node_strengths <- function(graph_layers, directed = FALSE) {
+
+  # assign node strengths ----
+  node_strengths <- lapply(graph_layers, function(g) {
+    strength_vals <- igraph::strength(g, mode = "all", loops = FALSE, weights = igraph::E(g)$weight)
+    names(strength_vals) <- as.character(seq_along(strength_vals))
+    return(strength_vals)
+  })
+
+  # return node strengths ----
+  return(node_strengths)
+}
+
+
+
+#' @title Community Overlap Edges
+#'
+#' @noRd
+
+community_overlap_edges <- function(
+    fit,
+    layer_links,
+    metric = c("jaccard", "overlap"),
+    min_similarity = 0,
+    node_weights_by_layer = NULL,
+    graph_layers = NULL
+  ) {
+
+  # check metric argument ----
+  metric <- match.arg(metric)
+
+  # assign appropriate simulation functions ----
+  sim_fun <- if (metric == "jaccard") weighted_jaccard else weighted_overlap
+  weighted_sim_fun <- if (metric == "jaccard") weighted_jaccard_similarity else weighted_overlap_similarity
+
+  # per-layer node identity: community index-sets are positions in each layer's
+  # own graph, so across layers with different node sets they must be translated
+  # to node NAMES before overlap is computed. Falls back to positions when the
+  # graphs carry no names (e.g. fixed-node simulations, where positions align). ----
+  node_ids <- function(l) {
+    if (!is.null(graph_layers)) {
+      nm <- igraph::V(graph_layers[[l]])$name
+      if (!is.null(nm)) return(as.character(nm))
+    }
+    NULL
+  }
+
+  # build overlap edges for each layer link ----
+  edge_rows <- vector("list", nrow(layer_links))
+  for (i in seq_len(nrow(layer_links))) {
+
+    ## extract layer link information ----
+    from_idx <- layer_links$from[i]
+    to_idx <- layer_links$to[i]
+    layer_weight <- layer_links$weight[i]
+    from_comms <- fit[[from_idx]]$communities
+    to_comms <- fit[[to_idx]]$communities
+    fnm <- node_ids(from_idx); tnm <- node_ids(to_idx)
+
+    ## translate community position-sets to node ids (names when available) ----
+    fset <- if (!is.null(fnm)) lapply(from_comms, function(p) fnm[p]) else lapply(from_comms, as.integer)
+    tset <- if (!is.null(tnm)) lapply(to_comms,   function(p) tnm[p]) else lapply(to_comms,   as.integer)
+
+    if (is.null(node_weights_by_layer)) {
+      ## FAST unweighted path: only co-occurring community pairs contribute a
+      ## non-zero overlap. Map each shared node to its (from_comm, to_comm) and
+      ## count co-occurrences = intersection sizes -- O(n), not O(C x C). ----
+      fsize <- lengths(fset); tsize <- lengths(tset)
+      node2f <- stats::setNames(rep(names(fset), fsize), unlist(fset, use.names = FALSE))
+      node2t <- stats::setNames(rep(names(tset), tsize), unlist(tset, use.names = FALSE))
+      shared <- intersect(unlist(fset, use.names = FALSE), unlist(tset, use.names = FALSE))
+      if (length(shared) == 0L) next
+      pair <- paste(node2f[shared], node2t[shared], sep = "\r")
+      ct <- table(pair)
+      pk <- do.call(rbind, strsplit(names(ct), "\r", fixed = TRUE))
+      fc_id <- as.integer(pk[, 1]); tc_id <- as.integer(pk[, 2]); inter <- as.integer(ct)
+      sz_f <- fsize[as.character(fc_id)]; sz_t <- tsize[as.character(tc_id)]
+      sim <- if (metric == "jaccard") inter / (sz_f + sz_t - inter) else inter / pmin(sz_f, sz_t)
+      weighted_sim <- sim * layer_weight
+      keep <- weighted_sim >= min_similarity & inter > 0L
+      if (any(keep)) {
+        edge_rows[[i]] <- data.frame(
+          from_layer = from_idx, to_layer = to_idx,
+          from_community = fc_id[keep], to_community = tc_id[keep],
+          similarity = sim[keep], layer_weight = layer_weight,
+          weighted_similarity = weighted_sim[keep], stringsAsFactors = FALSE)
+      }
+    } else {
+      ## weighted path: only iterate co-occurring pairs (name-based), call the
+      ## weighted similarity on the node-id sets. ----
+      wf <- node_weights_by_layer[[from_idx]]; wt <- node_weights_by_layer[[to_idx]]
+      rows <- list()
+      for (fc in names(fset)) {
+        cand <- names(tset)[vapply(tset, function(s) length(intersect(fset[[fc]], s)) > 0, logical(1))]
+        for (tc in cand) {
+          sim <- weighted_sim_fun(fset[[fc]], tset[[tc]], wf, wt)
+          weighted_sim <- sim * layer_weight
+          if (weighted_sim >= min_similarity)
+            rows[[length(rows) + 1]] <- data.frame(from_layer = from_idx, to_layer = to_idx,
+              from_community = as.integer(fc), to_community = as.integer(tc),
+              similarity = sim, layer_weight = layer_weight,
+              weighted_similarity = weighted_sim, stringsAsFactors = FALSE)
+        }
+      }
+      if (length(rows)) edge_rows[[i]] <- do.call(rbind, rows)
+    }
+  }
+  edge_rows <- edge_rows[!vapply(edge_rows, is.null, logical(1))]
+
+  # compile overlap edges data ----
+  if (length(edge_rows) == 0) {
+    overlap_edges <- data.frame(
+      from_layer = integer(0),
+      to_layer = integer(0),
+      from_community = integer(0),
+      to_community = integer(0),
+      similarity = numeric(0),
+      layer_weight = numeric(0),
+      weighted_similarity = numeric(0)
+    )
+  } else {
+    overlap_edges <- do.call(rbind, edge_rows)
+  }
+
+  # return overlap edges ----
+  return(overlap_edges)
+}
+
+
+
+#' @title Add Community Self Loops
+#'
+#' @noRd
+
+add_community_self_loops <- function(
+    edge_df,
+    fit,
+    layer_links,
+    self_loop_multiplier = 1,
+    min_similarity = 0,
+    directed = FALSE
+  ) {
+
+  # initialize loop rows ----
+  loop_rows <- list()
+
+  # Undirected self-loops count each internal edge twice (A[i,j] + A[j,i])
+  self_sim <- if (directed) 1 else 2
+
+  # compute maximum layer weight for each unique layer across all layer links ----
+  all_layers <- sort(unique(c(layer_links$from, layer_links$to)))
+  layer_weights <- vapply(
+    all_layers,
+    function(idx) {
+      max(
+        c(
+          layer_links$weight[layer_links$from == idx],
+          layer_links$weight[layer_links$to == idx]
+        )
+      )
+    },
+    numeric(1)
+  )
+
+  # assign names to layer weights ----
+  names(layer_weights) <- as.character(all_layers)
+
+  # assemble loop data for each layer and community ----
+  for (layer_idx in all_layers) {
+    layer_weight <- layer_weights[as.character(layer_idx)]
+    comms <- fit[[layer_idx]]$communities
+    for (comm_idx in as.integer(names(comms))) {
+      weighted_sim <- self_sim * layer_weight * self_loop_multiplier
+      if (weighted_sim >= min_similarity) {
+        loop_rows[[length(loop_rows) + 1]] <- data.frame(
+          from_layer = layer_idx,
+          to_layer = layer_idx,
+          from_community = comm_idx,
+          to_community = comm_idx,
+          similarity = self_sim,
+          layer_weight = layer_weight,
+          weighted_similarity = weighted_sim,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  # compile community self loops ----
+  if (length(loop_rows) == 0) {
+    community_self_loops <- edge_df
+  } else {
+    community_self_loops <- rbind(edge_df, do.call(rbind, loop_rows))
+  }
+
+  # return community self loops ----
+  return(community_self_loops)
+}
+
+
+#' @title Detect cross-layer (meta) communities from interlayer ties
+#'
+#' @description Second-stage community detection. Treats each per-layer
+#' community as a node in a community graph whose edges are the interlayer
+#' similarity ties (plus the community self-loops), then runs community
+#' detection on that graph to group per-layer communities into cross-layer
+#' \emph{meta-communities}. The result is the tracked partition: which
+#' communities persist, merge, or split across layers. This is the step that
+#' makes custom \code{layer_links} and the interlayer coupling actually affect
+#' the membership that is returned and validated.
+#'
+#' @param layer_communities The \code{layer_communities} element of a fit
+#'   (per-layer detection results, each with \code{membership} and
+#'   \code{communities}).
+#'
+#' @param interlayer_ties The \code{interlayer_ties} data frame of a fit
+#'   (columns \code{from_layer}, \code{to_layer}, \code{from_community},
+#'   \code{to_community}, \code{weighted_similarity}), including self-loops.
+#'
+#' @param algorithm Community algorithm for the second stage: \code{"louvain"}
+#'   or \code{"leiden"} (match the per-layer algorithm).
+#'
+#' @param resolution_parameter Resolution for the second-stage detection.
+#'
+#' @return A list with \describe{
+#'   \item{meta_ids}{Named integer vector mapping each per-layer community
+#'     (key \code{"L<layer>C<community>"}) to its meta-community id.}
+#'   \item{membership}{List with one integer vector per layer giving each
+#'     node's meta-community assignment (node order).}
+#' }
+#'
+#' @noRd
+detect_interlayer_communities <- function(
+    layer_communities,
+    interlayer_ties,
+    algorithm = c("louvain", "leiden"),
+    resolution_parameter = 1
+  ) {
+
+  algorithm <- match.arg(algorithm)
+  key <- function(l, c) paste0("L", l, "C", c)
+  n_layers <- length(layer_communities)
+
+  # The second stage needs community-level ties. Node-level identity ties are
+  # not handled here (their multislice form is a separate node-level build);
+  # fall back to per-layer communities made globally distinct, i.e. no
+  # cross-layer merging. ----
+  has_comm_ties <- !is.null(interlayer_ties) && nrow(interlayer_ties) > 0 &&
+    all(c("from_community", "to_community", "weighted_similarity") %in%
+          names(interlayer_ties))
+  if (!has_comm_ties) {
+    offset <- 0L
+    membership <- vector("list", n_layers)
+    for (t in seq_len(n_layers)) {
+      mem <- as.integer(layer_communities[[t]]$membership)
+      membership[[t]] <- mem + offset
+      offset <- offset + max(mem)
+    }
+    return(list(meta_ids = NULL, membership = membership))
+  }
+
+  # enumerate every per-layer community as a super-node ----
+  supernodes <- unique(unlist(lapply(seq_len(n_layers), function(t) {
+    key(t, as.integer(names(layer_communities[[t]]$communities)))
+  })))
+
+  # build the community graph from interlayer ties (incl. self-loops) ----
+  if (!is.null(interlayer_ties) && nrow(interlayer_ties) > 0) {
+    edge_df <- data.frame(
+      from = key(interlayer_ties$from_layer, interlayer_ties$from_community),
+      to = key(interlayer_ties$to_layer, interlayer_ties$to_community),
+      weight = interlayer_ties$weighted_similarity,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    edge_df <- data.frame(from = character(0), to = character(0),
+                          weight = numeric(0), stringsAsFactors = FALSE)
+  }
+
+  g <- igraph::graph_from_data_frame(
+    d = edge_df,
+    directed = FALSE,
+    vertices = data.frame(name = supernodes, stringsAsFactors = FALSE)
+  )
+
+  # second-stage detection on the community graph ----
+  if (igraph::ecount(g) == 0) {
+    # no ties: every per-layer community is its own meta-community
+    meta_ids <- stats::setNames(seq_along(supernodes), supernodes)
+  } else {
+    if (algorithm == "louvain") {
+      cl <- igraph::cluster_louvain(
+        graph = g, weights = igraph::E(g)$weight,
+        resolution = resolution_parameter
+      )
+    } else {
+      cl <- igraph::cluster_leiden(
+        graph = g, objective_function = "modularity",
+        weights = igraph::E(g)$weight,
+        resolution = resolution_parameter, n_iterations = 3
+      )
+    }
+    meta_ids <- as.integer(igraph::membership(cl))
+    names(meta_ids) <- igraph::V(g)$name
+  }
+
+  # map each node to its meta-community, per layer ----
+  membership <- lapply(seq_len(n_layers), function(t) {
+    mem <- layer_communities[[t]]$membership
+    as.integer(meta_ids[key(t, as.integer(mem))])
+  })
+
+  list(meta_ids = meta_ids, membership = membership)
+}
+
+
+#' @title Multislice (Mucha) meta-communities for node-identity coupling
+#'
+#' @description Node-level second stage for the identity specification: builds a
+#' single supra-graph by stacking the layers (intra-layer edges are each
+#' layer's own adjacency) and adding interlayer identity edges (each node tied
+#' to its own copies in the coupled layers, weighted by the layer-link weight),
+#' then runs one community detection on the whole supra-graph. This is Mucha et
+#' al. (2010) multislice modularity with the coupling given by
+#' \code{layer_links}. A node's meta-community can therefore be pulled across
+#' layers through the identity ties.
+#'
+#' @param graph_layers List of per-layer \code{igraph} objects.
+#'
+#' @param interlayer_ties Node-level identity ties (columns \code{from_layer},
+#'   \code{to_layer}, \code{node}, \code{layer_weight}).
+#'
+#' @param algorithm \code{"louvain"} or \code{"leiden"} for the supra-graph.
+#'
+#' @param omega Interlayer coupling strength (Mucha's omega). Multiplies the
+#'   interlayer identity-edge weights. Larger omega couples layers more
+#'   strongly (and, past a point, over-merges into one community); smaller
+#'   omega decouples toward per-layer detection. Use to explore the
+#'   omega-sensitivity of multislice.
+#'
+#' @param resolution_parameter Resolution for the supra-graph detection. Larger
+#'   values yield more, smaller communities; this is the knob for the
+#'   modularity resolution limit.
+#'
+#' @return List with one integer vector per layer giving each node's
+#'   meta-community assignment (node order).
+#'
+#' @noRd
+detect_multislice_communities <- function(
+    graph_layers,
+    interlayer_ties,
+    algorithm = c("louvain", "leiden"),
+    omega = 1,
+    resolution_parameter = 1
+  ) {
+
+  algorithm <- match.arg(algorithm)
+  vkey <- function(l, node) paste0("L", l, "N", node)
+  n_layers <- length(graph_layers)
+
+  layer_nodes <- lapply(graph_layers, function(g) {
+    nm <- igraph::V(g)$name
+    if (is.null(nm)) as.character(seq_len(igraph::vcount(g))) else as.character(nm)
+  })
+
+  # supra vertices: one per (layer, node) ----
+  verts <- unlist(lapply(seq_len(n_layers), function(t) vkey(t, layer_nodes[[t]])))
+
+  # intra-layer edges: each layer's own adjacency (original network) ----
+  intra <- do.call(rbind, lapply(seq_len(n_layers), function(t) {
+    g <- graph_layers[[t]]
+    el <- igraph::as_edgelist(g, names = TRUE)
+    if (nrow(el) == 0) return(NULL)
+    w <- igraph::E(g)$weight
+    if (is.null(w)) w <- rep(1, nrow(el))
+    data.frame(from = vkey(t, el[, 1]), to = vkey(t, el[, 2]),
+               weight = w, stringsAsFactors = FALSE)
+  }))
+
+  # interlayer edges: identity ties (node to its own copy), weighted by omega ----
+  if (!is.null(interlayer_ties) && nrow(interlayer_ties) > 0) {
+    w <- interlayer_ties$layer_weight
+    if (is.null(w)) w <- rep(1, nrow(interlayer_ties))
+    w <- w * omega
+    inter <- data.frame(
+      from = vkey(interlayer_ties$from_layer, interlayer_ties$node),
+      to = vkey(interlayer_ties$to_layer, interlayer_ties$node),
+      weight = w, stringsAsFactors = FALSE
+    )
+  } else {
+    inter <- NULL
+  }
+
+  edges <- rbind(intra, inter)
+  g_supra <- igraph::graph_from_data_frame(
+    d = if (is.null(edges)) data.frame(from = character(0), to = character(0),
+                                       weight = numeric(0)) else edges,
+    directed = FALSE,
+    vertices = data.frame(name = unique(verts), stringsAsFactors = FALSE)
+  )
+
+  # single detection on the supra-graph ----
+  if (igraph::ecount(g_supra) == 0) {
+    meta <- stats::setNames(seq_along(igraph::V(g_supra)), igraph::V(g_supra)$name)
+  } else if (algorithm == "louvain") {
+    cl <- igraph::cluster_louvain(g_supra, weights = igraph::E(g_supra)$weight,
+                                  resolution = resolution_parameter)
+    meta <- stats::setNames(as.integer(igraph::membership(cl)), igraph::V(g_supra)$name)
+  } else {
+    cl <- igraph::cluster_leiden(g_supra, objective_function = "modularity",
+                                 weights = igraph::E(g_supra)$weight,
+                                 resolution = resolution_parameter,
+                                 n_iterations = 3)
+    meta <- stats::setNames(as.integer(igraph::membership(cl)), igraph::V(g_supra)$name)
+  }
+
+  # map back to per-layer node order ----
+  lapply(seq_len(n_layers), function(t) as.integer(meta[vkey(t, layer_nodes[[t]])]))
+}
